@@ -36,6 +36,14 @@ state = {
     "sync_status": "idle", # idle | running | success | failed
     "plex_restarts": 0,
     "container_starts": {},  # container_name -> last seen StartedAt
+    "sync_stats": {        # stats from last PlexTraktSync run
+        "movies_synced": None,
+        "shows_synced": None,
+        "ratings_synced": None,
+        "watched_synced": None,
+        "duration": None,
+    },
+    "sync_history": [],    # list of past sync results (max 20)
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -116,13 +124,44 @@ def restart_plex(trigger_container: str):
 # ──────────────────────────────────────────────
 # PlexTraktSync job
 # ──────────────────────────────────────────────
+def parse_sync_stats(output: str) -> dict:
+    """Parse PlexTraktSync output for statistics."""
+    import re
+    stats = {
+        "movies_synced": 0,
+        "shows_synced": 0,
+        "ratings_synced": 0,
+        "watched_synced": 0,
+    }
+    # Count lines with sync actions
+    for line in output.splitlines():
+        l = line.lower()
+        if "mark as watched" in l or "marked as watched" in l:
+            stats["watched_synced"] += 1
+        if "rating" in l and ("update" in l or "set" in l or "trakt" in l):
+            stats["ratings_synced"] += 1
+        if re.search(r'movie.*sync|sync.*movie', l):
+            stats["movies_synced"] += 1
+        if re.search(r'(show|episode|season).*sync|sync.*(show|episode)', l):
+            stats["shows_synced"] += 1
+    # Also look for summary lines like "Found X movies"
+    m = re.search(r'(\d+)\s+movie', output, re.IGNORECASE)
+    if m and stats["movies_synced"] == 0:
+        stats["movies_synced"] = int(m.group(1))
+    m = re.search(r'(\d+)\s+(?:show|episode)', output, re.IGNORECASE)
+    if m and stats["shows_synced"] == 0:
+        stats["shows_synced"] = int(m.group(1))
+    return stats
+
+
 def run_plextraktsync():
     if state["sync_status"] == "running":
         add_event("warn", "PlexTraktSync al actief — overgeslagen")
         return
 
     state["sync_status"] = "running"
-    state["last_sync"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    start_time = datetime.now()
+    state["last_sync"] = start_time.strftime("%Y-%m-%d %H:%M:%S")
     add_event("info", "PlexTraktSync gestart")
 
     try:
@@ -131,12 +170,32 @@ def run_plextraktsync():
              "run", "--rm", PLEXTRAKTSYNC_CONTAINER, "sync"],
             capture_output=True, text=True, timeout=3600
         )
+        duration = int((datetime.now() - start_time).total_seconds())
+        combined_output = result.stdout + result.stderr
+
         if result.returncode == 0:
             state["sync_status"] = "success"
-            add_event("success", "PlexTraktSync voltooid")
+            stats = parse_sync_stats(combined_output)
+            stats["duration"] = duration
+            state["sync_stats"] = stats
+            # Add to history (max 20)
+            history_entry = {
+                "time": state["last_sync"],
+                "status": "success",
+                "duration": duration,
+                **stats,
+            }
+            state["sync_history"].insert(0, history_entry)
+            state["sync_history"] = state["sync_history"][:20]
+            add_event("success", f"PlexTraktSync voltooid in {duration}s — "
+                      f"{stats['watched_synced']} watched, {stats['ratings_synced']} ratings")
         else:
             state["sync_status"] = "failed"
-            add_event("error", f"PlexTraktSync gefaald: {result.stderr[-200:]}")
+            state["sync_history"].insert(0, {
+                "time": state["last_sync"], "status": "failed", "duration": duration
+            })
+            state["sync_history"] = state["sync_history"][:20]
+            add_event("error", f"PlexTraktSync gefaald: {combined_output[-300:]}")
     except subprocess.TimeoutExpired:
         state["sync_status"] = "failed"
         add_event("error", "PlexTraktSync timeout (>1 uur)")
@@ -161,6 +220,8 @@ def api_status():
         "next_sync": state["next_sync"],
         "plex_restarts": state["plex_restarts"],
         "containers": containers,
+        "sync_stats": state["sync_stats"],
+        "sync_history": state["sync_history"],
         "config": {
             "watch_containers": WATCH_CONTAINERS,
             "plex_restart_delay": PLEX_RESTART_DELAY,
@@ -240,6 +301,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .ev-msg { color: #ccc; }
   .config-list { font-size: 0.8rem; line-height: 2; }
   .config-list span { color: #e2b96f; }
+  .sync-stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 12px 0; }
+  .sync-stat { background: #111; border-radius: 6px; padding: 8px; text-align: center; }
+  .sync-stat .val { font-size: 1.4rem; font-weight: 700; color: #e2b96f; }
+  .sync-stat .lbl { font-size: 0.7rem; color: #666; margin-top: 2px; }
+  .history-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; margin-top: 8px; }
+  .history-table th { color: #666; font-weight: 500; text-align: left; padding: 4px 6px; border-bottom: 1px solid #2a2a2a; }
+  .history-table td { padding: 4px 6px; border-bottom: 1px solid #1a1a1a; color: #ccc; }
+  .history-table tr:hover td { background: #1e1e1e; }
+  .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.7rem; font-weight: 600; }
+  .pill.success { background: #1b5e20; color: #a5d6a7; }
+  .pill.failed { background: #b71c1c; color: #ef9a9a; }
 </style>
 </head>
 <body>
@@ -260,6 +332,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <div class="stat"><div class="val" id="last-sync" style="font-size:0.9rem">—</div><div class="lbl">Laatste sync</div></div>
       <div class="stat"><div class="val" id="next-sync" style="font-size:0.9rem">—</div><div class="lbl">Volgende sync</div></div>
     </div>
+    <div class="sync-stats-grid" id="sync-stats"></div>
     <div class="btn-row">
       <button class="btn" onclick="triggerSync()">▶ Nu synchen</button>
     </div>
@@ -279,6 +352,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="card events">
     <h2>Events log</h2>
     <div class="event-list" id="events"></div>
+  </div>
+
+  <div class="card" style="grid-column: 1 / -1;">
+    <h2>Sync geschiedenis</h2>
+    <table class="history-table">
+      <thead><tr><th>Tijd</th><th>Status</th><th>Duur</th><th>Watched</th><th>Ratings</th><th>Films</th><th>Series</th></tr></thead>
+      <tbody id="sync-history"></tbody>
+    </table>
   </div>
 </div>
 
@@ -302,6 +383,31 @@ async function fetchStatus() {
   document.getElementById('last-sync').textContent = d.last_sync || '—';
   document.getElementById('next-sync').textContent = d.next_sync || '—';
   document.getElementById('plex-restarts').textContent = d.plex_restarts;
+
+  // Sync stats
+  const s = d.sync_stats;
+  const statsItems = [
+    { val: s.watched_synced ?? '—', lbl: 'Watched' },
+    { val: s.ratings_synced ?? '—', lbl: 'Ratings' },
+    { val: s.movies_synced ?? '—', lbl: 'Films' },
+    { val: s.shows_synced ?? '—', lbl: 'Series' },
+  ];
+  document.getElementById('sync-stats').innerHTML = statsItems.map(i =>
+    `<div class="sync-stat"><div class="val">${i.val}</div><div class="lbl">${i.lbl}</div></div>`
+  ).join('');
+
+  // Sync history
+  document.getElementById('sync-history').innerHTML = (d.sync_history || []).map(h =>
+    `<tr>
+      <td>${h.time}</td>
+      <td><span class="pill ${h.status}">${h.status}</span></td>
+      <td>${h.duration ? h.duration + 's' : '—'}</td>
+      <td>${h.watched_synced ?? '—'}</td>
+      <td>${h.ratings_synced ?? '—'}</td>
+      <td>${h.movies_synced ?? '—'}</td>
+      <td>${h.shows_synced ?? '—'}</td>
+    </tr>`
+  ).join('') || '<tr><td colspan="7" style="color:#555;text-align:center;padding:12px">Nog geen syncs uitgevoerd</td></tr>';
 
   // Config
   document.getElementById('config-info').innerHTML = `
