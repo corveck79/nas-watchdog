@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  watchdog:
+    build: .
+    container_name: watchdog
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /volume1/docker/plextraktsync:/plextraktsync
+    environment:
+      TZ: Europe/Amsterdam
+      # Containers om te bewaken (kommagescheiden)
+      WATCH_CONTAINERS: "zurg,rclone"
+      # Seconden wachten na restart voordat Plex herstart wordt
+      PLEX_RESTART_DELAY: "60"
+      # Hoe vaak watchdog checkt (seconden)
+      WATCHDOG_INTERVAL: "30"
+      # Plex container naam
+      PLEX_CONTAINER: "plex"
+      # PlexTraktSync container naam
+      PLEXTRAKTSYNC_CONTAINER: "plextraktsync"
+      # Cron schema voor PlexTraktSync (default: 06:00 en 18:00)
+      PLEXTRAKTSYNC_SCHEDULE: "0 6,18 * * *"
